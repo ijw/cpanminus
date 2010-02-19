@@ -6,11 +6,12 @@ use Fatal qw(chdir);
 use File::Spec;
 use Getopt::Long;
 
-my($notest, $force);
+my($notest, $force, $localpkg);
 
 GetOptions(
     'f|force'  => \$force,
     'n|notest' => \$notest,
+    'l|localpkg=s' => \$localpkg
 );
 
 sub get($);
@@ -18,7 +19,44 @@ sub mirror($$);
 sub untar;
 sub which;
 
-init_tools();
+if (eval { require LWP::Simple }) {
+    *get = \&LWP::Simple::get;
+    *mirror = \&LWP::Simple::mirror;
+} elsif (my $wget = which 'wget') {
+    *get = sub ($) {
+        my $uri = shift;
+        open my $fh, "$wget $uri -O - |" or die "wget $uri: $!";
+        local $/;
+            <$fh>;
+    };
+    *mirror = sub ($$) {
+        my($uri, $path) = @_;
+        `$wget $uri -O $path`;
+    };
+}
+# TODO curl
+
+if (my $tar = which 'tar'){
+    *untar = sub {
+        my($tarfile) = @_;
+        my $suf = $tarfile =~ /bz2$/ ? 'j' : 'z';
+        system "$tar xvf$suf $tarfile";
+        my @files = `$tar tf$suf $tarfile`;
+        if (@files) {
+            chomp $files[0];
+            return $files[0];
+        } else {
+            return undef;
+        }
+    }
+} elsif (eval { require Archive::Tar }) { # uses too much memory!
+    *untar = sub {
+        my $t = Archive::Tar->new($_[0]);
+        my $root = ($t->list_files)[0];
+        $t->extract;
+        return -d $root ? $root : undef;
+    };
+}
 
 sub diag {
     print STDERR @_;
@@ -27,16 +65,21 @@ sub diag {
 my $Base = "$ENV{HOME}/.cpanm";
 mkdir $Base, 0777 unless -e $Base;
 
-unless (@ARGV) {
+unless ($localpkg xor scalar @ARGV) {
     die <<USAGE;
-Usage: cpanm [--force] [--notest] Module
+Usage: cpanm [--force] [--notest] [--localpkg=DIR-WITH-META.yml | Module]
 USAGE
 }
 
 my %seen;
 
-for my $module (@ARGV) {
-    install_module($module);
+
+if(!defined($localpkg)) {
+    for my $module (@ARGV) {
+        install_module($module);
+    }
+} else {
+    process_dir_deps($localpkg);
 }
 
 sub run($) {
@@ -81,34 +124,8 @@ sub install_module {
         return;
     }
 
-    diag "Entering $dir ...\n";
-    chdir $dir;
 
-    if (-e 'META.yml') {
-        diag "Checking dependencies ...\n";
-        my $meta = (Parse::CPAN::Meta::LoadFile('META.yml'))[0];
-        my %deps = (%{$meta->{requires} || {}}, %{$meta->{build_requires} || {}});
-
-        my @install;
-        while (my($mod, $ver) = each %deps) {
-            next if $mod eq 'perl' or $mod eq 'Config';
-            diag "Checking if you have $mod $ver ... ";
-            my $test = `$^X -e 'eval q{use $mod $ver (); print "OK:", $mod->VERSION'}`;
-            if ($test =~ s/^OK://) {
-                diag "Yes ($test)\n";
-            } else {
-                diag "No\n";
-                push @install, $mod;
-            }
-        }
-
-        for my $mod (@install) {
-            install_module($mod);
-        }
-
-        chdir $Base;
-        chdir $dir;
-    }
+    process_dir_deps($dir);
 
     diag "Building $module ...\n";
 
@@ -137,6 +154,41 @@ sub install_module {
     }
 }
 
+sub process_dir_deps {
+    my $dir = shift;
+
+    diag "Entering $dir ...\n";
+    chdir $dir;
+
+    if (-e 'META.yml') {
+        diag "Checking dependencies ...\n";
+        my $meta = (Parse::CPAN::Meta::LoadFile('META.yml'))[0];
+        my %deps = (%{$meta->{requires} || {}}, %{$meta->{build_requires} || {}});
+
+        my @install;
+        while (my($mod, $ver) = each %deps) {
+            next if $mod eq 'perl' or $mod eq 'Config';
+            diag "Checking if you have $mod $ver ... ";
+            my $test = `$^X -e 'eval q{use $mod $ver (); print "OK:", $mod->VERSION'}`;
+            if ($test =~ s/^OK://) {
+                diag "Yes ($test)\n";
+            } else {
+                diag "No\n";
+                push @install, $mod;
+            }
+        }
+
+        for my $mod (@install) {
+            install_module($mod);
+        }
+
+        chdir $Base;
+        chdir $dir;
+    }
+}
+
+
+
 sub find_module {
     my $module = shift;
     my $html = get("http://search.cpan.org/perldoc?$module");
@@ -156,47 +208,6 @@ sub which {
         }
     }
     return;
-}
-
-sub init_tools {
-    if (eval { require LWP::Simple }) {
-        *get = \&LWP::Simple::get;
-        *mirror = \&LWP::Simple::mirror;
-    } elsif (my $wget = which 'wget') {
-        *get = sub ($) {
-            my $uri = shift;
-            open my $fh, "$wget $uri -O - |" or die "wget $uri: $!";
-            local $/;
-            <$fh>;
-        };
-        *mirror = sub ($$) {
-            my($uri, $path) = @_;
-            `$wget $uri -O $path`;
-        };
-    }
-    # TODO curl
-
-    if (my $tar = which 'tar'){
-        *untar = sub {
-            my($tarfile) = @_;
-            my $suf = $tarfile =~ /bz2$/ ? 'j' : 'z';
-            system "$tar xvf$suf $tarfile";
-            my @files = `$tar tf$suf $tarfile`;
-            if (@files) {
-                chomp $files[0];
-                return $files[0];
-            } else {
-                return undef;
-            }
-        }
-    } elsif (eval { require Archive::Tar }) { # uses too much memory!
-        *untar = sub {
-            my $t = Archive::Tar->new($_[0]);
-            my $root = ($t->list_files)[0];
-            $t->extract;
-            return -d $root ? $root : undef;
-        };
-    }
 }
 
 ### Inline Parse::CPAN::Meta
